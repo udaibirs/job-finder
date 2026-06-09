@@ -62,8 +62,36 @@ class Source:
 # --------------------------------------------------------------------------- #
 # Live sources
 # --------------------------------------------------------------------------- #
+class Remotive(Source):
+    """Open JSON API, no key, server-side keyword search. Works from datacenters."""
+    name = "Remotive"
+    API = "https://remotive.com/api/remote-jobs"
+
+    def fetch(self, keyword, location):
+        params = {"search": keyword} if keyword else {}
+        r = requests.get(self.API, headers=HEADERS, params=params, timeout=25)
+        r.raise_for_status()
+        jobs = []
+        for row in r.json().get("jobs", []):
+            jobs.append(Job(
+                title=row.get("title", ""),
+                company=row.get("company_name", ""),
+                location=row.get("candidate_required_location") or "Remote",
+                url=row.get("url", ""),
+                source=self.name,
+                posted=(row.get("publication_date", "") or "")[:10],
+                salary=row.get("salary", "") or "",
+                tags=",".join(row.get("tags", []) or []),
+            ))
+        return jobs  # Remotive already filtered by the search term
+
+
 class RemoteOK(Source):
+    # RemoteOK's Cloudflare returns 403 to datacenter IPs (e.g. Render), on both the
+    # JSON API and the RSS feed, regardless of User-Agent. So it is off by default and
+    # needs a proxy with a residential IP, or a paid jobs API, to work from the server.
     name = "RemoteOK"
+    configured = False
     API = "https://remoteok.com/api"
     RSS = "https://remoteok.com/remote-jobs.rss"
 
@@ -192,7 +220,7 @@ class LinkedInJobs(_APIStub):
     name = "LinkedIn Jobs"
 
 
-ALL_SOURCES = [RemoteOK(), WeWorkRemotely(), IndeedIndia(), Naukri(), LinkedInJobs()]
+ALL_SOURCES = [Remotive(), WeWorkRemotely(), RemoteOK(), IndeedIndia(), Naukri(), LinkedInJobs()]
 REGISTRY = {s.name: s for s in ALL_SOURCES}
 
 
