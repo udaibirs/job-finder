@@ -15,7 +15,14 @@ from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 DEFAULT_LOCATION = "India"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; JobScraper/1.0)"}
+# A realistic browser User-Agent. RemoteOK's Cloudflare blocks bot-style agents
+# (it returns an HTML challenge instead of JSON), so we present as a browser.
+HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -57,12 +64,22 @@ class Source:
 # --------------------------------------------------------------------------- #
 class RemoteOK(Source):
     name = "RemoteOK"
+    API = "https://remoteok.com/api"
+    RSS = "https://remoteok.com/remote-jobs.rss"
 
     def fetch(self, keyword, location):
-        r = requests.get("https://remoteok.com/api", headers=HEADERS, timeout=25)
+        """Try the JSON API; if it's blocked or not JSON, fall back to the RSS feed."""
+        try:
+            return self._fetch_json(keyword)
+        except Exception:
+            return self._fetch_rss(keyword)
+
+    def _fetch_json(self, keyword):
+        r = requests.get(self.API, headers=HEADERS, timeout=25)
         r.raise_for_status()
+        data = r.json()  # raises if Cloudflare served an HTML challenge instead
         jobs = []
-        for row in r.json():
+        for row in data:
             if not isinstance(row, dict) or not row.get("position"):
                 continue
             lo, hi = row.get("salary_min"), row.get("salary_max")
@@ -78,6 +95,25 @@ class RemoteOK(Source):
                 tags=",".join(row.get("tags", []) or []),
             )
             if keyword_match(job, keyword):
+                jobs.append(job)
+        return jobs
+
+    def _fetch_rss(self, keyword):
+        r = requests.get(self.RSS, headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        jobs = []
+        for item in root.iter("item"):
+            job = Job(
+                title=_text(item, "title"),
+                company=_text(item, "company"),
+                location=_text(item, "location") or "Remote",
+                url=_text(item, "link"),
+                source=self.name,
+                posted=_text(item, "pubDate")[:16],
+                tags=_text(item, "tags"),
+            )
+            if job.title and keyword_match(job, keyword):
                 jobs.append(job)
         return jobs
 
