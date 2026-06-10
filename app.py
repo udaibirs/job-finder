@@ -18,6 +18,7 @@ from flask import Flask, render_template_string, request, jsonify
 
 app = Flask(__name__)
 DEFAULT_LOCATION = "India"
+COUNTRY_OPTIONS = ["India", "USA", "Germany", "Malaysia", "Singapore"]
 # A realistic browser User-Agent. RemoteOK's Cloudflare blocks bot-style agents
 # (it returns an HTML challenge instead of JSON), so we present as a browser.
 HEADERS = {
@@ -180,20 +181,29 @@ class Himalayas(Source):
         return jobs
 
 
-class AdzunaIndia(Source):
-    """Adzuna aggregates many job boards and has an India endpoint with real salary
-    and contract-type data. Free tier needs an app id + key, read from the env:
-    ADZUNA_APP_ID and ADZUNA_APP_KEY. Until both are set it stays 'setup needed'.
+class Adzuna(Source):
+    """Adzuna aggregates many boards with real salary + contract data. Free tier
+    needs ADZUNA_APP_ID and ADZUNA_APP_KEY in the env. Uses country-specific
+    endpoints. Malaysia is not covered by Adzuna (Jooble handles that market).
     """
-    name = "Adzuna India"
+    name = "Adzuna"
     APP_ID = os.environ.get("ADZUNA_APP_ID", "")
     APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
     configured = bool(APP_ID and APP_KEY)
-    API = "https://api.adzuna.com/v1/api/jobs/in/search/1"  # 'in' = India
+    # country name -> (Adzuna country code, currency symbol)
+    COUNTRIES = {
+        "india": ("in", "₹"), "usa": ("us", "$"), "united states": ("us", "$"),
+        "germany": ("de", "€"), "singapore": ("sg", "S$"),
+    }
 
     def fetch(self, keyword, location):
         if not self.configured:
             return []
+        entry = self.COUNTRIES.get((location or "india").strip().lower())
+        if not entry:
+            return []  # country Adzuna doesn't serve (e.g. Malaysia)
+        code, cur = entry
+        api = f"https://api.adzuna.com/v1/api/jobs/{code}/search/1"
         params = {
             "app_id": self.APP_ID,
             "app_key": self.APP_KEY,
@@ -201,19 +211,16 @@ class AdzunaIndia(Source):
             "what": keyword or "",
             "content-type": "application/json",
         }
-        # The endpoint is already scoped to India; a non-default value narrows to a city.
-        if location and location.strip().lower() != "india":
-            params["where"] = location.strip()
-        r = requests.get(self.API, headers=HEADERS, params=params, timeout=25)
+        r = requests.get(api, headers=HEADERS, params=params, timeout=25)
         r.raise_for_status()
         jobs = []
         for row in r.json().get("results", []):
             lo, hi = row.get("salary_min"), row.get("salary_max")
-            salary = f"₹{int(lo):,} - ₹{int(hi):,}" if lo and hi else ""
+            salary = f"{cur}{int(lo):,} - {cur}{int(hi):,}" if lo and hi else ""
             jobs.append(Job(
                 title=row.get("title", ""),
                 company=(row.get("company") or {}).get("display_name", ""),
-                location=(row.get("location") or {}).get("display_name", "India"),
+                location=(row.get("location") or {}).get("display_name", location),
                 url=row.get("redirect_url", ""),
                 source=self.name,
                 posted=(row.get("created", "") or "")[:10],
@@ -234,7 +241,9 @@ class Jooble(Source):
     def fetch(self, keyword, location):
         if not self.configured:
             return []
-        body = {"keywords": keyword or "", "location": location or "India"}
+        loc = (location or "India").strip()
+        loc = {"usa": "United States"}.get(loc.lower(), loc)  # Jooble prefers full name
+        body = {"keywords": keyword or "", "location": loc}
         r = requests.post(f"https://jooble.org/api/{self.KEY}",
                           json=body, headers=HEADERS, timeout=25)
         r.raise_for_status()
@@ -396,7 +405,7 @@ class Wellfound(_APIStub):
 
 
 ALL_SOURCES = [Remotive(), WeWorkRemotely(), Jobicy(), Arbeitnow(), Himalayas(),
-               AdzunaIndia(), Jooble(),
+               Adzuna(), Jooble(),
                RemoteOK(), IndeedIndia(), Naukri(), LinkedInJobs(), Wellfound()]
 REGISTRY = {s.name: s for s in ALL_SOURCES}
 
@@ -434,6 +443,7 @@ def index():
         PAGE,
         sources=[{"name": s.name, "configured": s.configured} for s in ALL_SOURCES],
         default_location=DEFAULT_LOCATION,
+        countries=COUNTRY_OPTIONS,
     )
 
 
@@ -465,7 +475,8 @@ PAGE = r"""<!doctype html>
   form { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-end; background:var(--card); padding:16px; border-radius:14px; border:1px solid var(--line); }
   .field { display:flex; flex-direction:column; gap:6px; }
   .field label { font-size:12px; color:var(--muted); }
-  input[type=text] { background:#11152a; border:1px solid var(--line); color:var(--text); padding:10px 12px; border-radius:9px; font-size:14px; min-width:220px; }
+  input[type=text], select { background:#11152a; border:1px solid var(--line); color:var(--text); padding:10px 12px; border-radius:9px; font-size:14px; min-width:220px; }
+  select { min-width:160px; cursor:pointer; }
   button { background:var(--acc); color:#fff; border:0; padding:11px 20px; border-radius:9px; font-size:14px; font-weight:600; cursor:pointer; }
   button:disabled { opacity:.6; cursor:default; }
   .sources { display:flex; flex-wrap:wrap; gap:14px; margin:14px 2px 0; }
@@ -498,7 +509,11 @@ PAGE = r"""<!doctype html>
     </div>
     <div class="field">
       <label for="location">Location</label>
-      <input type="text" id="location" name="location" value="{{ default_location }}">
+      <select id="location" name="location">
+        {% for c in countries %}
+        <option value="{{ c }}" {{ 'selected' if c == default_location else '' }}>{{ c }}</option>
+        {% endfor %}
+      </select>
     </div>
     <button type="submit" id="go">Search</button>
     <div class="sources">
