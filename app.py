@@ -76,7 +76,7 @@ class Remotive(Source):
         r.raise_for_status()
         jobs = []
         for row in r.json().get("jobs", []):
-            jobs.append(Job(
+            job = Job(
                 title=row.get("title", ""),
                 company=row.get("company_name", ""),
                 location=row.get("candidate_required_location") or "Remote",
@@ -85,8 +85,12 @@ class Remotive(Source):
                 posted=(row.get("publication_date", "") or "")[:10],
                 salary=row.get("salary", "") or "",
                 tags=",".join(row.get("tags", []) or []),
-            ))
-        return jobs  # Remotive already filtered by the search term
+            )
+            # Remotive's `search` param is unreliable (often returns the same recent
+            # set regardless of term), so filter locally on title + tags.
+            if keyword_match(job, keyword):
+                jobs.append(job)
+        return jobs
 
 
 def _epoch_date(value):
@@ -383,9 +387,17 @@ class LinkedInJobs(_APIStub):
     name = "LinkedIn Jobs"
 
 
+class Wellfound(_APIStub):
+    # Wellfound (ex-AngelList Talent) has no official public jobs API. Access needs
+    # a paid scraper such as an Apify Wellfound actor; direct scraping is Cloudflare
+    # /login-walled and blocks datacenter IPs. Implement fetch() with the provider
+    # and flip configured = True.
+    name = "Wellfound"
+
+
 ALL_SOURCES = [Remotive(), WeWorkRemotely(), Jobicy(), Arbeitnow(), Himalayas(),
                AdzunaIndia(), Jooble(),
-               RemoteOK(), IndeedIndia(), Naukri(), LinkedInJobs()]
+               RemoteOK(), IndeedIndia(), Naukri(), LinkedInJobs(), Wellfound()]
 REGISTRY = {s.name: s for s in ALL_SOURCES}
 
 
