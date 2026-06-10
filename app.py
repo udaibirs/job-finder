@@ -3,12 +3,15 @@
 Keyword search across live job sources, default location India, results on a web
 page. Everything is in this one file so it uploads to GitHub with no folders.
 
-Live sources (no setup): RemoteOK (JSON API), WeWorkRemotely (RSS).
-Blocked sources (need a provider key): Indeed India, Naukri, LinkedIn Jobs.
+Live sources (no setup): Remotive, WeWorkRemotely, Jobicy, Arbeitnow, Himalayas.
+Setup-needed sources: RemoteOK (datacenter IP blocked), Indeed India, Naukri,
+LinkedIn Jobs (need a paid jobs API).
 """
+import os
 import re
 import requests
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, render_template_string, request, jsonify
@@ -84,6 +87,166 @@ class Remotive(Source):
                 tags=",".join(row.get("tags", []) or []),
             ))
         return jobs  # Remotive already filtered by the search term
+
+
+def _epoch_date(value):
+    """Turn a unix epoch int (or anything else) into a YYYY-MM-DD string."""
+    try:
+        return datetime.fromtimestamp(int(value), timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        return str(value or "")[:10]
+
+
+class Jobicy(Source):
+    """Open JSON API, no key. Remote jobs, supports a tag filter. Works from servers."""
+    name = "Jobicy"
+    API = "https://jobicy.com/api/v2/remote-jobs"
+
+    def fetch(self, keyword, location):
+        params = {"count": 50}
+        if keyword:
+            params["tag"] = keyword  # Jobicy treats this as a search term
+        r = requests.get(self.API, headers=HEADERS, params=params, timeout=25)
+        r.raise_for_status()
+        jobs = []
+        for row in r.json().get("jobs", []):
+            industry = row.get("jobIndustry") or []
+            job = Job(
+                title=row.get("jobTitle", ""),
+                company=row.get("companyName", ""),
+                location=row.get("jobGeo") or "Remote",
+                url=row.get("url", ""),
+                source=self.name,
+                posted=(row.get("pubDate", "") or "")[:10],
+                tags=",".join(industry) if isinstance(industry, list) else str(industry),
+            )
+            if job.title and keyword_match(job, keyword):
+                jobs.append(job)
+        return jobs
+
+
+class Arbeitnow(Source):
+    """Open JSON API, no key. Returns recent listings; filtered locally by keyword."""
+    name = "Arbeitnow"
+    API = "https://www.arbeitnow.com/api/job-board-api"
+
+    def fetch(self, keyword, location):
+        r = requests.get(self.API, headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        jobs = []
+        for row in r.json().get("data", []):
+            tags = row.get("tags") or []
+            job = Job(
+                title=row.get("title", ""),
+                company=row.get("company_name", ""),
+                location=row.get("location") or ("Remote" if row.get("remote") else ""),
+                url=row.get("url", ""),
+                source=self.name,
+                posted=_epoch_date(row.get("created_at")),
+                tags=",".join(tags) if isinstance(tags, list) else str(tags),
+            )
+            if job.title and keyword_match(job, keyword):
+                jobs.append(job)
+        return jobs
+
+
+class Himalayas(Source):
+    """Open JSON API, no key. Recent remote jobs; filtered locally by keyword."""
+    name = "Himalayas"
+    API = "https://himalayas.app/jobs/api"
+
+    def fetch(self, keyword, location):
+        r = requests.get(self.API, headers=HEADERS, params={"limit": 50}, timeout=25)
+        r.raise_for_status()
+        jobs = []
+        for row in r.json().get("jobs", []):
+            cats = row.get("categories") or []
+            locs = row.get("locationRestrictions") or []
+            job = Job(
+                title=row.get("title", ""),
+                company=row.get("companyName", ""),
+                location=", ".join(locs) if isinstance(locs, list) and locs else "Remote",
+                url=row.get("applicationLink", ""),
+                source=self.name,
+                posted=_epoch_date(row.get("pubDate")),
+                tags=",".join(cats) if isinstance(cats, list) else str(cats),
+            )
+            if job.title and keyword_match(job, keyword):
+                jobs.append(job)
+        return jobs
+
+
+class AdzunaIndia(Source):
+    """Adzuna aggregates many job boards and has an India endpoint with real salary
+    and contract-type data. Free tier needs an app id + key, read from the env:
+    ADZUNA_APP_ID and ADZUNA_APP_KEY. Until both are set it stays 'setup needed'.
+    """
+    name = "Adzuna India"
+    APP_ID = os.environ.get("ADZUNA_APP_ID", "")
+    APP_KEY = os.environ.get("ADZUNA_APP_KEY", "")
+    configured = bool(APP_ID and APP_KEY)
+    API = "https://api.adzuna.com/v1/api/jobs/in/search/1"  # 'in' = India
+
+    def fetch(self, keyword, location):
+        if not self.configured:
+            return []
+        params = {
+            "app_id": self.APP_ID,
+            "app_key": self.APP_KEY,
+            "results_per_page": 50,
+            "what": keyword or "",
+            "content-type": "application/json",
+        }
+        # The endpoint is already scoped to India; a non-default value narrows to a city.
+        if location and location.strip().lower() != "india":
+            params["where"] = location.strip()
+        r = requests.get(self.API, headers=HEADERS, params=params, timeout=25)
+        r.raise_for_status()
+        jobs = []
+        for row in r.json().get("results", []):
+            lo, hi = row.get("salary_min"), row.get("salary_max")
+            salary = f"₹{int(lo):,} - ₹{int(hi):,}" if lo and hi else ""
+            jobs.append(Job(
+                title=row.get("title", ""),
+                company=(row.get("company") or {}).get("display_name", ""),
+                location=(row.get("location") or {}).get("display_name", "India"),
+                url=row.get("redirect_url", ""),
+                source=self.name,
+                posted=(row.get("created", "") or "")[:10],
+                salary=salary,
+                tags=(row.get("category") or {}).get("label", ""),
+            ))
+        return jobs  # Adzuna already filtered by `what`
+
+
+class Jooble(Source):
+    """Jooble aggregates listings across the web and supports India. Free tier needs
+    an API key, read from the env: JOOBLE_KEY. POST {keywords, location}.
+    """
+    name = "Jooble"
+    KEY = os.environ.get("JOOBLE_APP_KEY", "")
+    configured = bool(KEY)
+
+    def fetch(self, keyword, location):
+        if not self.configured:
+            return []
+        body = {"keywords": keyword or "", "location": location or "India"}
+        r = requests.post(f"https://jooble.org/api/{self.KEY}",
+                          json=body, headers=HEADERS, timeout=25)
+        r.raise_for_status()
+        jobs = []
+        for row in r.json().get("jobs", []):
+            jobs.append(Job(
+                title=row.get("title", ""),
+                company=row.get("company", ""),
+                location=row.get("location", "") or "India",
+                url=row.get("link", ""),
+                source=self.name,
+                posted=(row.get("updated", "") or "")[:10],
+                salary=row.get("salary", "") or "",
+                tags=row.get("type", "") or "",
+            ))
+        return jobs  # Jooble already filtered by keywords
 
 
 class RemoteOK(Source):
@@ -220,7 +383,9 @@ class LinkedInJobs(_APIStub):
     name = "LinkedIn Jobs"
 
 
-ALL_SOURCES = [Remotive(), WeWorkRemotely(), RemoteOK(), IndeedIndia(), Naukri(), LinkedInJobs()]
+ALL_SOURCES = [Remotive(), WeWorkRemotely(), Jobicy(), Arbeitnow(), Himalayas(),
+               AdzunaIndia(), Jooble(),
+               RemoteOK(), IndeedIndia(), Naukri(), LinkedInJobs()]
 REGISTRY = {s.name: s for s in ALL_SOURCES}
 
 
